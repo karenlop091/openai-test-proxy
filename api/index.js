@@ -1,57 +1,56 @@
 import express from "express";
-import fetch from "node-fetch";
+import axios from "axios";
 import { v4 as uuidv4 } from "uuid";
+import serverless from "serverless-http";
 
 const app = express();
 app.use(express.json());
 
-const MASTER_KEY = process.env.OPENAI_KEY;
-const TOKEN_LIMIT = Number(process.env.TOKEN_LIMIT || 10000);
-const TTL_HOURS = Number(process.env.TTL_HOURS || 24);
+const OPENAI_KEY = process.env.OPENAI_KEY;
+const TOKEN_LIMIT = parseInt(process.env.TOKEN_LIMIT || "10000");
+const TTL_HOURS = parseInt(process.env.TTL_HOURS || "24");
 
-const candidates = new Map();
+const keys = new Map();
 
-// crear una clave temporal desde la URL /create-key?name=...
+// Crear clave temporal
 app.get("/create-key", (req, res) => {
-  const name = req.query.name || "anon";
+  const { name } = req.query;
   const key = uuidv4();
-  candidates.set(key, {
-    name,
-    created: Date.now(),
-    tokensLeft: TOKEN_LIMIT,
-  });
+  const expiresAt = Date.now() + TTL_HOURS * 60 * 60 * 1000;
+  keys.set(key, { name: name || "anon", used: 0, expiresAt });
   res.json({ key, expiresInHours: TTL_HOURS, tokensLeft: TOKEN_LIMIT });
 });
 
-// proxy real hacia OpenAI
-app.post("/proxy", async (req, res) => {
-  const key = req.headers["x-test-key"];
-  const user = candidates.get(key);
+// Endpoint proxy para reenviar a OpenAI
+app.post("/chat", async (req, res) => {
+  const auth = req.headers.authorization || "";
+  const token = auth.replace("Bearer ", "").trim();
+  const entry = keys.get(token);
 
-  if (!user) return res.status(401).json({ error: "Invalid key" });
-  const age = (Date.now() - user.created) / (1000 * 60 * 60);
-  if (age > TTL_HOURS) return res.status(403).json({ error: "Key expired" });
-  if (user.tokensLeft <= 0) return res.status(403).json({ error: "Quota exceeded" });
+  if (!entry) return res.status(401).json({ error: "Clave inválida o expirada" });
+  if (Date.now() > entry.expiresAt) return res.status(403).json({ error: "Clave expirada" });
+  if (entry.used >= TOKEN_LIMIT) return res.status(403).json({ error: "Límite de tokens alcanzado" });
 
   try {
-    const r = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${MASTER_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(req.body)
-    });
+    const response = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
+      req.body,
+      {
+        headers: {
+          Authorization: `Bearer ${OPENAI_KEY}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
 
-    const data = await r.json();
-    const used = data?.usage?.total_tokens ?? 0;
-    user.tokensLeft -= used;
-
-    res.status(r.status).json({ ...data, remaining: user.tokensLeft });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Proxy error" });
+    const tokensUsed = response.data.usage?.total_tokens || 0;
+    entry.used += tokensUsed;
+    res.json({ ...response.data, remaining: Math.max(0, TOKEN_LIMIT - entry.used) });
+  } catch (error) {
+    const message = error?.response?.data || error.message || "Proxy error";
+    res.status(500).json({ error: message });
   }
 });
 
+export const handler = serverless(app);
 export default app;
